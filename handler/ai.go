@@ -2,6 +2,7 @@ package handler
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,8 +10,10 @@ import (
 	"mime"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"strings"
 
+	"github.com/basketikun/infinite-canvas/model"
 	"github.com/basketikun/infinite-canvas/service"
 )
 
@@ -50,13 +53,17 @@ func proxyAIGetRequest(w http.ResponseWriter, r *http.Request, path string) {
 	channel, err := service.SelectModelChannel(modelName)
 	if err != nil {
 		log.Printf("AI proxy select channel failed: model=%s err=%v", modelName, err)
-		Fail(w, "AI 接口请求失败")
+		Fail(w, aiStatusMessage(0))
+		return
+	}
+	if isAgnesAI(channel.Protocol, channel.BaseURL, modelName) {
+		proxyAgnesGetRequest(w, channel, modelName, path)
 		return
 	}
 	path = resolveAIProxyPath(channel.BaseURL, modelName, path)
 	request, err := http.NewRequest(http.MethodGet, service.BuildModelChannelURL(channel, path), nil)
 	if err != nil {
-		Fail(w, "AI 接口请求失败")
+		Fail(w, aiStatusMessage(0))
 		return
 	}
 	request.Header.Set("Authorization", "Bearer "+channel.APIKey)
@@ -67,7 +74,7 @@ func proxyAIRequest(w http.ResponseWriter, r *http.Request, path string) {
 	body, contentType, modelName, err := readAIRequest(r)
 	if err != nil {
 		log.Printf("AI proxy request read failed: %v", err)
-		Fail(w, "AI 接口请求失败")
+		Fail(w, aiStatusMessage(0))
 		return
 	}
 	user, ok := service.UserFromContext(r.Context())
@@ -78,21 +85,33 @@ func proxyAIRequest(w http.ResponseWriter, r *http.Request, path string) {
 	credits, err := service.ModelCost(modelName)
 	if err != nil {
 		log.Printf("AI proxy read model cost failed: model=%s err=%v", modelName, err)
-		Fail(w, "AI 接口请求失败")
+		Fail(w, aiStatusMessage(0))
 		return
 	}
 	credits *= readAIRequestCount(body, contentType)
 	channel, err := service.SelectModelChannel(modelName)
 	if err != nil {
 		log.Printf("AI proxy select channel failed: model=%s err=%v", modelName, err)
-		Fail(w, "AI 接口请求失败")
+		Fail(w, aiStatusMessage(0))
+		return
+	}
+	if isAgnesAI(channel.Protocol, channel.BaseURL, modelName) {
+		if err := service.ConsumeUserCredits(user.ID, modelName, credits, path); err != nil {
+			FailError(w, err)
+			return
+		}
+		proxyAgnesPostRequest(w, channel, path, body, contentType, func() {
+			if err := service.RefundUserCredits(user.ID, modelName, credits, path); err != nil {
+				log.Printf("AI proxy refund credits failed: user=%s model=%s credits=%d err=%v", user.ID, modelName, credits, err)
+			}
+		})
 		return
 	}
 	path = resolveAIProxyPath(channel.BaseURL, modelName, path)
 	request, err := http.NewRequest(http.MethodPost, service.BuildModelChannelURL(channel, path), bytes.NewReader(body))
 	if err != nil {
 		log.Printf("AI proxy build request failed: url=%s err=%v", service.BuildModelChannelURL(channel, path), err)
-		Fail(w, "AI 接口请求失败")
+		Fail(w, aiStatusMessage(0))
 		return
 	}
 	request.Header.Set("Authorization", "Bearer "+channel.APIKey)
@@ -117,7 +136,7 @@ func copyAIResponse(w http.ResponseWriter, request *http.Request, onFailure func
 		if onFailure != nil {
 			onFailure()
 		}
-		Fail(w, "AI 接口请求失败")
+		Fail(w, aiStatusMessage(0))
 		return
 	}
 	defer response.Body.Close()
@@ -213,6 +232,282 @@ func readAIRequestCount(body []byte, contentType string) int {
 
 var errMissingModel = &aiError{"缺少模型名称"}
 
+func isAgnesAI(protocol string, baseURL string, modelName string) bool {
+	protocol = strings.ToLower(strings.TrimSpace(protocol))
+	baseURL = strings.ToLower(strings.TrimSpace(baseURL))
+	modelName = strings.ToLower(strings.TrimSpace(modelName))
+	return protocol == "agnes" || strings.Contains(baseURL, "agnes-ai.com") || strings.HasPrefix(modelName, "agnes-")
+}
+
+func proxyAgnesPostRequest(w http.ResponseWriter, channel model.ModelChannel, path string, body []byte, contentType string, onFailure func()) {
+	var requestBody []byte
+	var targetPath string
+	var err error
+	if path == "/images/generations" {
+		requestBody, err = agnesImageGenerationBody(body)
+		targetPath = "/v1/images/generations"
+	} else if path == "/images/edits" {
+		requestBody, err = agnesImageEditBody(body, contentType)
+		targetPath = "/v1/images/generations"
+	} else if path == "/videos" {
+		requestBody, err = agnesVideoBody(body, contentType)
+		targetPath = "/v1/videos"
+	} else {
+		Fail(w, aiStatusMessage(0))
+		return
+	}
+	if err != nil {
+		log.Printf("Agnes proxy transform failed: path=%s err=%v", path, err)
+		if onFailure != nil {
+			onFailure()
+		}
+		Fail(w, aiStatusMessage(0))
+		return
+	}
+	request, err := http.NewRequest(http.MethodPost, agnesChannelURL(channel.BaseURL, targetPath), bytes.NewReader(requestBody))
+	if err != nil {
+		if onFailure != nil {
+			onFailure()
+		}
+		Fail(w, aiStatusMessage(0))
+		return
+	}
+	request.Header.Set("Authorization", "Bearer "+channel.APIKey)
+	request.Header.Set("Content-Type", "application/json")
+	if path == "/videos" {
+		copyAgnesVideoCreateResponse(w, request, onFailure)
+		return
+	}
+	copyAIResponse(w, request, onFailure)
+}
+
+func proxyAgnesGetRequest(w http.ResponseWriter, channel model.ModelChannel, modelName string, path string) {
+	if strings.HasPrefix(path, "/videos/") && strings.HasSuffix(path, "/content") {
+		id := strings.TrimSuffix(strings.TrimPrefix(path, "/videos/"), "/content")
+		proxyAgnesVideoContent(w, channel, id, modelName)
+		return
+	}
+	if strings.HasPrefix(path, "/videos/") {
+		id := strings.TrimPrefix(path, "/videos/")
+		request, err := http.NewRequest(http.MethodGet, agnesVideoStatusURL(channel.BaseURL, id, modelName), nil)
+		if err != nil {
+			Fail(w, aiStatusMessage(0))
+			return
+		}
+		request.Header.Set("Authorization", "Bearer "+channel.APIKey)
+		copyAIResponse(w, request, nil)
+		return
+	}
+	Fail(w, aiStatusMessage(0))
+}
+
+func agnesImageGenerationBody(body []byte) ([]byte, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return nil, err
+	}
+	delete(payload, "response_format")
+	delete(payload, "output_format")
+	payload["return_base64"] = true
+	return json.Marshal(payload)
+}
+
+func agnesImageEditBody(body []byte, contentType string) ([]byte, error) {
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return nil, err
+	}
+	form, err := multipart.NewReader(bytes.NewReader(body), params["boundary"]).ReadForm(64 << 20)
+	if err != nil {
+		return nil, err
+	}
+	defer form.RemoveAll()
+	payload := map[string]any{
+		"model":         firstFormValue(form, "model"),
+		"prompt":        firstFormValue(form, "prompt"),
+		"return_base64": true,
+	}
+	if value := firstFormValue(form, "size"); value != "" {
+		payload["size"] = value
+	}
+	if value := firstFormValue(form, "n"); value != "" {
+		payload["n"] = value
+	}
+	images := []string{}
+	for _, header := range form.File["image"] {
+		image, err := multipartFileDataURL(header)
+		if err != nil {
+			return nil, err
+		}
+		images = append(images, image)
+	}
+	if len(images) > 0 {
+		payload["image"] = images
+	}
+	return json.Marshal(payload)
+}
+
+func agnesVideoBody(body []byte, contentType string) ([]byte, error) {
+	if !strings.HasPrefix(contentType, "multipart/form-data") {
+		return body, nil
+	}
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return nil, err
+	}
+	form, err := multipart.NewReader(bytes.NewReader(body), params["boundary"]).ReadForm(64 << 20)
+	if err != nil {
+		return nil, err
+	}
+	defer form.RemoveAll()
+	payload := map[string]any{
+		"model":      firstFormValue(form, "model"),
+		"prompt":     firstFormValue(form, "prompt"),
+		"num_frames": 121,
+		"frame_rate": 24,
+	}
+	if width, height := agnesVideoSize(firstFormValue(form, "size")); width > 0 && height > 0 {
+		payload["width"] = width
+		payload["height"] = height
+	}
+	images := []string{}
+	for _, header := range form.File["input_reference[]"] {
+		image, err := multipartFileDataURL(header)
+		if err != nil {
+			return nil, err
+		}
+		images = append(images, image)
+	}
+	if len(images) == 1 {
+		payload["image"] = images[0]
+	} else if len(images) > 1 {
+		payload["extra_body"] = map[string]any{"image": images}
+	}
+	return json.Marshal(payload)
+}
+
+func copyAgnesVideoCreateResponse(w http.ResponseWriter, request *http.Request, onFailure func()) {
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		if onFailure != nil {
+			onFailure()
+		}
+		Fail(w, aiStatusMessage(0))
+		return
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(response.Body)
+	if response.StatusCode >= http.StatusBadRequest {
+		if onFailure != nil {
+			onFailure()
+		}
+		Fail(w, aiUpstreamStatusMessage(response.StatusCode, body))
+		return
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err == nil {
+		if videoID, ok := payload["video_id"].(string); ok && strings.TrimSpace(videoID) != "" {
+			payload["id"] = videoID
+			body, _ = json.Marshal(payload)
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(response.StatusCode)
+	_, _ = w.Write(body)
+}
+
+func proxyAgnesVideoContent(w http.ResponseWriter, channel model.ModelChannel, id string, modelName string) {
+	request, err := http.NewRequest(http.MethodGet, agnesVideoStatusURL(channel.BaseURL, id, modelName), nil)
+	if err != nil {
+		Fail(w, aiStatusMessage(0))
+		return
+	}
+	request.Header.Set("Authorization", "Bearer "+channel.APIKey)
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		Fail(w, aiStatusMessage(0))
+		return
+	}
+	defer response.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(response.Body, 4096))
+	if response.StatusCode >= http.StatusBadRequest {
+		Fail(w, aiUpstreamStatusMessage(response.StatusCode, body))
+		return
+	}
+	var payload struct {
+		URL string `json:"remixed_from_video_id"`
+	}
+	_ = json.Unmarshal(body, &payload)
+	if strings.TrimSpace(payload.URL) == "" {
+		Fail(w, aiStatusMessage(0))
+		return
+	}
+	download, err := http.Get(payload.URL)
+	if err != nil {
+		Fail(w, aiStatusMessage(0))
+		return
+	}
+	defer download.Body.Close()
+	if download.StatusCode >= http.StatusBadRequest {
+		Fail(w, aiStatusMessage(download.StatusCode))
+		return
+	}
+	for key, values := range download.Header {
+		if strings.EqualFold(key, "Content-Length") {
+			continue
+		}
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
+	}
+	w.WriteHeader(download.StatusCode)
+	_, _ = io.Copy(w, download.Body)
+}
+
+func agnesChannelURL(baseURL string, path string) string {
+	return strings.TrimRight(strings.TrimSpace(baseURL), "/") + path
+}
+
+func agnesVideoStatusURL(baseURL string, id string, modelName string) string {
+	values := url.Values{}
+	values.Set("video_id", id)
+	if strings.TrimSpace(modelName) != "" {
+		values.Set("model_name", modelName)
+	}
+	return agnesChannelURL(baseURL, "/agnesapi?") + values.Encode()
+}
+
+func firstFormValue(form *multipart.Form, key string) string {
+	if values := form.Value[key]; len(values) > 0 {
+		return values[0]
+	}
+	return ""
+}
+
+func multipartFileDataURL(header *multipart.FileHeader) (string, error) {
+	file, err := header.Open()
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+	data, err := io.ReadAll(file)
+	if err != nil {
+		return "", err
+	}
+	contentType := header.Header.Get("Content-Type")
+	if contentType == "" {
+		contentType = http.DetectContentType(data)
+	}
+	return "data:" + contentType + ";base64," + base64.StdEncoding.EncodeToString(data), nil
+}
+
+func agnesVideoSize(size string) (int, int) {
+	var width, height int
+	if _, err := fmt.Sscanf(size, "%dx%d", &width, &height); err == nil && width > 0 && height > 0 {
+		return width, height
+	}
+	return 1152, 768
+}
 func resolveAIProxyPath(baseURL string, modelName string, path string) string {
 	if !isArkSeedanceVideo(baseURL, modelName) {
 		return path

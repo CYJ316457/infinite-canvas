@@ -172,6 +172,15 @@ function aiApiUrl(config: AiConfig, path: string) {
     return config.channelMode === "remote" ? `/api/v1${path}` : buildApiUrl(config.baseUrl, path);
 }
 
+function isAgnesConfig(config: AiConfig) {
+    const model = (config.model || config.imageModel).trim().toLowerCase();
+    return config.channelMode === "local" && (model.startsWith("agnes-") || config.baseUrl.toLowerCase().includes("agnes-ai.com"));
+}
+
+function agnesApiUrl(config: AiConfig, path: string) {
+    return `${config.baseUrl.trim().replace(/\/+$/, "")}${path}`;
+}
+
 function aiHeaders(config: AiConfig, contentType?: string) {
     const token = useUserStore.getState().token;
     return config.channelMode === "remote"
@@ -198,6 +207,7 @@ export async function requestGeneration(config: AiConfig, prompt: string) {
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     const quality = normalizeQuality(config.quality);
     const requestSize = resolveRequestSize(quality, config.size);
+    if (isAgnesConfig(config)) return requestAgnesGeneration(config, prompt, n, requestSize);
     try {
         const response = await axios.post<ImageApiResponse>(
             aiApiUrl(config, "/images/generations"),
@@ -226,6 +236,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
     const n = Math.max(1, Math.min(15, Math.floor(Math.abs(Number(config.count)) || 1)));
     const quality = normalizeQuality(config.quality);
     const requestSize = resolveRequestSize(quality, config.size);
+    if (isAgnesConfig(config)) return requestAgnesEdit(config, prompt, references, n, requestSize);
     const requestPrompt = buildImageReferencePromptText(prompt, references);
     const formData = new FormData();
     formData.set("model", config.model);
@@ -248,6 +259,46 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
         const images = parseImagePayload(response.data);
         refreshRemoteUser(config);
         return images;
+    } catch (error) {
+        throw new Error(readAxiosError(error, "请求失败"));
+    }
+}
+
+async function requestAgnesGeneration(config: AiConfig, prompt: string, n: number, requestSize: string | undefined) {
+    try {
+        const response = await axios.post<ImageApiResponse>(
+            agnesApiUrl(config, "/v1/images/generations"),
+            {
+                model: config.model || config.imageModel,
+                prompt: withSystemPrompt(config, prompt),
+                n,
+                ...(requestSize ? { size: requestSize } : {}),
+                return_base64: true,
+            },
+            { headers: aiHeaders(config, "application/json") },
+        );
+        return parseImagePayload(response.data);
+    } catch (error) {
+        throw new Error(readAxiosError(error, "请求失败"));
+    }
+}
+
+async function requestAgnesEdit(config: AiConfig, prompt: string, references: ReferenceImage[], n: number, requestSize: string | undefined) {
+    try {
+        const images = await Promise.all(references.map(async (image) => imageToDataUrl(image)));
+        const response = await axios.post<ImageApiResponse>(
+            agnesApiUrl(config, "/v1/images/generations"),
+            {
+                model: config.model || config.imageModel,
+                prompt: withSystemPrompt(config, buildImageReferencePromptText(prompt, references)),
+                n,
+                ...(requestSize ? { size: requestSize } : {}),
+                image: images.filter(Boolean),
+                extra_body: { response_format: "b64_json" },
+            },
+            { headers: aiHeaders(config, "application/json") },
+        );
+        return parseImagePayload(response.data);
     } catch (error) {
         throw new Error(readAxiosError(error, "请求失败"));
     }

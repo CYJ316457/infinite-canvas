@@ -637,7 +637,7 @@ export default function AdminSettingsPage() {
                             </Col>
                             <Col span={12}>
                                 <Form.Item name="protocol" label="协议">
-                                    <Select options={[{ label: "OpenAI", value: "openai" }]} />
+                                    <Select options={[{ label: "OpenAI", value: "openai" }, { label: "Agnes", value: "agnes" }]} />
                                 </Form.Item>
                             </Col>
                             <Col span={12}>

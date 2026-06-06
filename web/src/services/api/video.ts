@@ -18,12 +18,21 @@ type SeedanceTask = {
     content?: { video_url?: string; last_frame_url?: string } | null;
 };
 type ApiEnvelope<T> = T | { code?: number; data?: T | null; msg?: string };
+type AgnesVideoTask = VideoResponse & { video_id?: string; remixed_from_video_id?: string; progress?: number };
 type ReferenceMediaUploadResponse = { id: string; url: string; mimeType: string; bytes: number };
 
 export type VideoGenerationResult = { blob?: Blob; url?: string; mimeType?: string };
 
 function aiApiUrl(config: AiConfig, path: string) {
     return config.channelMode === "remote" ? `/api/v1${path}` : buildApiUrl(config.baseUrl, path);
+}
+
+function isAgnesConfig(config: AiConfig, model: string) {
+    return config.channelMode === "local" && (model.toLowerCase().startsWith("agnes-") || config.baseUrl.toLowerCase().includes("agnes-ai.com"));
+}
+
+function agnesApiUrl(config: AiConfig, path: string) {
+    return `${config.baseUrl.trim().replace(/\/+$/, "")}${path}`;
 }
 
 function aiHeaders(config: AiConfig, contentType?: string) {
@@ -46,6 +55,9 @@ function refreshRemoteUser(config: AiConfig) {
 export async function requestVideoGeneration(config: AiConfig, prompt: string, references: ReferenceImage[] = [], videoReferences: ReferenceVideo[] = [], audioReferences: ReferenceAudio[] = []): Promise<VideoGenerationResult> {
     const model = (config.model || config.videoModel).trim();
     assertVideoConfig(config, model);
+    if (isAgnesConfig(config, model)) {
+        return requestAgnesVideoGeneration(config, model, prompt, references);
+    }
     if (isSeedanceVideoConfig({ ...config, model })) {
         return requestSeedanceGeneration(config, model, prompt, references, videoReferences, audioReferences);
     }
@@ -59,6 +71,56 @@ export async function storeGeneratedVideo(result: VideoGenerationResult): Promis
     if (result.blob) return uploadMediaFile(result.blob, "video");
     if (result.url) return { url: result.url, storageKey: "", bytes: 0, mimeType: result.mimeType || "video/mp4" };
     throw new Error("视频接口没有返回可播放的视频");
+}
+
+async function requestAgnesVideoGeneration(config: AiConfig, model: string, prompt: string, references: ReferenceImage[]) {
+    try {
+        const body: Record<string, unknown> = {
+            model,
+            prompt,
+            ...agnesVideoDimensions(config.size),
+            num_frames: agnesNumFrames(config.videoSeconds),
+            frame_rate: 24,
+        };
+        const images = await Promise.all(references.map(async (image) => image.url || (await imageToDataUrl(image))));
+        const validImages = images.filter(Boolean);
+        if (validImages.length === 1) body.image = validImages[0];
+        if (validImages.length > 1) body.extra_body = { image: validImages };
+        const created = unwrapAgnesTask((await axios.post<ApiEnvelope<AgnesVideoTask>>(agnesApiUrl(config, "/v1/videos"), body, { headers: aiHeaders(config, "application/json") })).data);
+        const videoId = created.video_id || created.id;
+        if (!videoId) throw new Error("视频接口没有返回任务 ID");
+        for (let attempt = 0; attempt < 120; attempt += 1) {
+            const task = unwrapAgnesTask((await axios.get<ApiEnvelope<AgnesVideoTask>>(agnesApiUrl(config, `/agnesapi?video_id=${encodeURIComponent(videoId)}&model_name=${encodeURIComponent(model)}`), { headers: aiHeaders(config) })).data);
+            if (task.status === "completed") {
+                const url = task.remixed_from_video_id;
+                if (!url) throw new Error("视频任务成功但没有返回视频 URL");
+                refreshRemoteUser(config);
+                return videoResultFromUrl(url);
+            }
+            if (task.status === "failed" || task.status === "cancelled") throw new Error(task.error?.message || "视频生成失败");
+            if (attempt === 119) throw new Error("视频生成超时，请稍后重试");
+            await delay(5000);
+        }
+        throw new Error("视频生成超时，请稍后重试");
+    } catch (error) {
+        throw new Error(readAxiosError(error, "视频生成失败"));
+    }
+}
+
+function unwrapAgnesTask(payload: ApiEnvelope<AgnesVideoTask>) {
+    return unwrapEnvelope(payload, "接口没有返回视频任务");
+}
+
+function agnesVideoDimensions(size: string) {
+    const normalized = normalizeVideoSize(size) || "1152x768";
+    const [width, height] = normalized.split("x").map((value) => Number(value));
+    return Number.isFinite(width) && Number.isFinite(height) ? { width, height } : { width: 1152, height: 768 };
+}
+
+function agnesNumFrames(secondsValue: string) {
+    const seconds = Math.max(1, Math.min(18, Math.floor(Number(secondsValue) || 6)));
+    const target = Math.min(441, seconds * 24);
+    return Math.max(81, Math.floor((target - 1) / 8) * 8 + 1);
 }
 
 async function requestOpenAIVideoGeneration(config: AiConfig, model: string, prompt: string, references: ReferenceImage[]) {

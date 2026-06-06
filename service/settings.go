@@ -56,6 +56,9 @@ func AdminTestChannelModel(index *int, channel model.ModelChannel, modelName str
 	if err != nil {
 		return "", err
 	}
+	if isAgnesChannel(resolved) || isAgnesModelName(modelName) {
+		return testAgnesChannelModel(resolved, modelName)
+	}
 	if isArkAgentPlanChannel(resolved) || isSeedanceModelName(modelName) {
 		return testArkSeedanceChannelModel(resolved, modelName)
 	}
@@ -202,7 +205,7 @@ func SelectModelChannel(modelName string) (model.ModelChannel, error) {
 func BuildModelChannelURL(channel model.ModelChannel, path string) string {
 	baseURL := normalizeModelChannelBaseURL(channel.BaseURL)
 	lowerBaseURL := strings.ToLower(baseURL)
-	if !strings.HasSuffix(lowerBaseURL, "/v1") && !strings.HasSuffix(lowerBaseURL, "/api/v3") && !strings.HasSuffix(lowerBaseURL, "/api/plan/v3") {
+	if !isAgnesChannel(channel) && !strings.HasSuffix(lowerBaseURL, "/v1") && !strings.HasSuffix(lowerBaseURL, "/api/v3") && !strings.HasSuffix(lowerBaseURL, "/api/plan/v3") {
 		baseURL += "/v1"
 	}
 	return baseURL + path
@@ -233,6 +236,15 @@ func isArkAgentPlanChannel(channel model.ModelChannel) bool {
 	return strings.HasSuffix(baseURL, "/api/plan/v3")
 }
 
+func isAgnesChannel(channel model.ModelChannel) bool {
+	protocol := strings.ToLower(strings.TrimSpace(channel.Protocol))
+	baseURL := strings.ToLower(normalizeModelChannelBaseURL(channel.BaseURL))
+	return protocol == "agnes" || strings.Contains(baseURL, "agnes-ai.com")
+}
+
+func isAgnesModelName(modelName string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(modelName)), "agnes-")
+}
 func isSeedanceModelName(modelName string) bool {
 	modelName = strings.ToLower(strings.TrimSpace(modelName))
 	return strings.Contains(modelName, "seedance") || strings.Contains(modelName, "doubao-seedance")
@@ -283,12 +295,12 @@ func repairDefaultModel(current string, models []string, preferred func(string) 
 
 func isVideoModelName(modelName string) bool {
 	name := strings.ToLower(strings.TrimSpace(modelName))
-	return strings.Contains(name, "seedance") || strings.Contains(name, "video")
+	return strings.Contains(name, "agnes-video") || strings.Contains(name, "seedance") || strings.Contains(name, "video")
 }
 
 func isImageModelName(modelName string) bool {
 	name := strings.ToLower(strings.TrimSpace(modelName))
-	return strings.Contains(name, "seedream") || strings.Contains(name, "gpt-image") || strings.Contains(name, "image")
+	return strings.Contains(name, "agnes-image") || strings.Contains(name, "seedream") || strings.Contains(name, "gpt-image") || strings.Contains(name, "image")
 }
 
 func isTextModelName(modelName string) bool {
@@ -343,6 +355,9 @@ func resolveAdminChannel(index *int, channel model.ModelChannel) (model.ModelCha
 }
 
 func fetchAdminChannelModels(channel model.ModelChannel) ([]string, error) {
+	if isAgnesChannel(channel) {
+		return []string{"agnes-image-2.1-flash", "agnes-video-v2.0"}, nil
+	}
 	request, err := http.NewRequest(http.MethodGet, BuildModelChannelURL(channel, "/models"), nil)
 	if err != nil {
 		return nil, err
@@ -414,6 +429,19 @@ func testAdminChannelModel(channel model.ModelChannel, modelName string) (string
 		return payload.Choices[0].Message.Content, nil
 	}
 	return "ok", nil
+}
+
+func testAgnesChannelModel(channel model.ModelChannel, modelName string) (string, error) {
+	if strings.TrimSpace(modelName) == "" {
+		return "", errors.New("missing model name")
+	}
+	if strings.TrimSpace(channel.BaseURL) == "" {
+		return "", safeMessageError{message: "missing base url"}
+	}
+	if strings.TrimSpace(channel.APIKey) == "" {
+		return "", safeMessageError{message: "missing API key"}
+	}
+	return "Agnes channel format is valid. Use canvas generation to verify quota and model permission.", nil
 }
 
 func testArkSeedanceChannelModel(channel model.ModelChannel, modelName string) (string, error) {

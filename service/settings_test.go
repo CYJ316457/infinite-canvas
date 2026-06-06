@@ -61,6 +61,13 @@ func TestBuildModelChannelURLNormalizesArkPlanTaskPath(t *testing.T) {
 	}
 }
 
+func TestBuildModelChannelURLLeavesAgnesRoot(t *testing.T) {
+	got := BuildModelChannelURL(model.ModelChannel{Protocol: "agnes", BaseURL: "https://apihub.agnes-ai.com"}, "/agnesapi?video_id=video_123")
+	want := "https://apihub.agnes-ai.com/agnesapi?video_id=video_123"
+	if got != want {
+		t.Fatalf("BuildModelChannelURL = %q, want %q", got, want)
+	}
+}
 func TestNormalizeSettingsPublishesEnabledChannelModelsAndRepairsDefaults(t *testing.T) {
 	settings := normalizeSettings(model.Settings{
 		Public: model.PublicSetting{
@@ -96,5 +103,21 @@ func TestNormalizeSettingsPublishesEnabledChannelModelsAndRepairsDefaults(t *tes
 	}
 	if channel.DefaultVideoModel != "doubao-seedance-2.0-fast" {
 		t.Fatalf("default video model = %q, want seedance", channel.DefaultVideoModel)
+	}
+}
+
+func TestNormalizeSettingsClassifiesAgnesModels(t *testing.T) {
+	settings := normalizeSettings(model.Settings{
+		Private: model.PrivateSetting{
+			Channels: []model.ModelChannel{{Enabled: true, Protocol: "agnes", Models: []string{"agnes-image-2.1-flash", "agnes-video-v2.0"}}},
+		},
+	})
+
+	channel := settings.Public.ModelChannel
+	if channel.DefaultImageModel != "agnes-image-2.1-flash" {
+		t.Fatalf("default image model = %q, want Agnes image", channel.DefaultImageModel)
+	}
+	if channel.DefaultVideoModel != "agnes-video-v2.0" {
+		t.Fatalf("default video model = %q, want Agnes video", channel.DefaultVideoModel)
 	}
 }
